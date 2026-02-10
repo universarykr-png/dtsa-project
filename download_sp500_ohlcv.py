@@ -89,19 +89,30 @@ def download_one(ticker: str) -> tuple[str, bool, str]:
 
     for attempt in range(RETRIES):
         try:
-            data = yf.download(
-                ticker, period=PERIOD, interval="1d",
-                auto_adjust=False, progress=False,
-            )
+            # ★ yf.Ticker().history() 사용 (스레드 안전)
+            #   yf.download()는 멀티스레드에서 내부 공유 세션이 꼬여
+            #   다른 티커의 데이터가 섞여 들어오는 치명적 버그가 있음
+            t = yf.Ticker(ticker)
+            data = t.history(period=PERIOD, interval="1d", auto_adjust=False)
 
             if data is None or data.empty:
                 raise ValueError("EMPTY_DATA")
 
-            # ★ MultiIndex 컬럼 평탄화 (yfinance ≥0.2.31 핵심 수정)
-            if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.droplevel(level=1)
-
             data = data.reset_index()
+
+            # 컬럼명 표준화
+            col_map = {}
+            for c in data.columns:
+                low = str(c).strip().lower()
+                if low == "date":          col_map[c] = "Date"
+                elif low == "open":        col_map[c] = "Open"
+                elif low == "high":        col_map[c] = "High"
+                elif low == "low":         col_map[c] = "Low"
+                elif low == "close":       col_map[c] = "Close"
+                elif low in ("adj close", "adj_close", "adjclose"):
+                    col_map[c] = "Adj Close"
+                elif low == "volume":      col_map[c] = "Volume"
+            data = data.rename(columns=col_map)
 
             # 필요한 컬럼 검증
             if not VALID_CHECK_COLS.issubset(set(data.columns)):
@@ -110,7 +121,7 @@ def download_one(ticker: str) -> tuple[str, bool, str]:
             keep = [c for c in OHLCV_COLS_WITH_ADJ if c in data.columns]
             data = data[keep]
 
-            # ★ float64 → 소수점 2자리 반올림 (Yahoo Finance와 동일한 값)
+            # float64 → 소수점 2자리 반올림 (Yahoo Finance와 동일한 값)
             for c in ["Open", "High", "Low", "Close", "Adj Close"]:
                 if c in data.columns:
                     data[c] = data[c].round(2)

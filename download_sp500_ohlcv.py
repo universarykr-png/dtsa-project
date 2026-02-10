@@ -19,6 +19,7 @@ import time
 import re
 import zipfile
 import logging
+from io import StringIO
 
 import pandas as pd
 import yfinance as yf
@@ -45,7 +46,8 @@ def load_sp500_tickers() -> list[str]:
         )
     }
     html = requests.get(url, headers=headers, timeout=30).text
-    tables = pd.read_html(html)
+    # ★ StringIO 필수: 대용량 HTML을 직접 넘기면 파일경로로 오인하여 파싱 실패
+    tables = pd.read_html(StringIO(html))
     sp_df = tables[0]
 
     tickers = sp_df["Symbol"].dropna().astype(str).tolist()

@@ -5,16 +5,16 @@ NASDAQ 3-year OHLCV 다운로드 + 클린 + 티커별 CSV + ZIP
     pip install -r requirements.txt
     python download_nasdaq_ohlcv.py
 
-주요 수정사항 (원본 Colab 대비):
-- yfinance MultiIndex 컬럼 문제 해결 (단일 티커 다운로드 시에도 발생)
-- auto_adjust=False 로 변경하여 원본 OHLCV + Adj Close 보존
-  (auto_adjust=True 사용 시 TSLA, NVDA 등 주식분할 종목에서
-   실제 거래가와 다른 보정값이 출력되는 문제)
-- yf.Ticker().history() 를 사용하여 안정적 단일 티커 다운로드
+수정사항:
+- yf.download() MultiIndex 컬럼을 droplevel()로 평탄화
+- auto_adjust=False 로 원본 OHLCV 보존 + Adj Close 별도 보관
+- SKIP 캐시 검증: 깨진 CSV(Date만 있는 파일) 자동 삭제 후 재다운로드
+- 시작 시 이전 raw/clean 폴더 자동 삭제 (깨진 캐시 방지)
 """
 
 import os
 import glob
+import shutil
 import time
 import re
 import zipfile
@@ -60,60 +60,48 @@ MAX_WORKERS = 12
 RETRIES = 3
 CHUNK_DELAY = 5
 
-OHLCV_COLS = ["Date", "Open", "High", "Low", "Close", "Volume"]
-# Adj Close를 별도로 보관 (분석 시 활용 가능)
-OHLCV_COLS_WITH_ADJ = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
+OHLCV_COLS_WITH_ADJ = [
+    "Date", "Open", "High", "Low", "Close", "Adj Close", "Volume",
+]
+VALID_CHECK_COLS = {"Open", "High", "Low", "Close", "Volume"}
 
 
 # ── 3) 단일 티커 다운로드 ─────────────────────────────────
 def download_one(ticker: str) -> tuple[str, bool, str]:
-    """
-    yf.Ticker().history() 를 사용하여 단일 티커를 다운로드한다.
-    yf.download() 의 MultiIndex 컬럼 문제를 근본적으로 회피.
-
-    auto_adjust=False 로 설정하여 원본 OHLCV 값을 그대로 유지.
-    → TSLA, NVDA 등 주식분할 종목의 실제 거래 가격이 보존됨.
-    → 보정된 종가가 필요하면 'Adj Close' 컬럼 사용.
-    """
     out_path = os.path.join(OUTDIR_RAW, f"{ticker}_ohlcv_3y.csv")
+
+    # ★ SKIP 캐시 검증: OHLCV 컬럼이 실제로 있는지 확인
     if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return ticker, True, "SKIP"
+        try:
+            check = pd.read_csv(out_path, nrows=1)
+            if VALID_CHECK_COLS.issubset(set(check.columns)):
+                return ticker, True, "SKIP"
+        except Exception:
+            pass
+        # 깨진 파일 → 삭제 후 재다운로드
+        os.remove(out_path)
 
     for attempt in range(RETRIES):
         try:
-            t = yf.Ticker(ticker)
-            data = t.history(period=PERIOD, interval="1d", auto_adjust=False)
+            data = yf.download(
+                ticker, period=PERIOD, interval="1d",
+                auto_adjust=False, progress=False,
+            )
 
             if data is None or data.empty:
                 raise ValueError("EMPTY_DATA")
 
+            # ★ MultiIndex 컬럼 평탄화 (yfinance ≥0.2.31 핵심 수정)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.droplevel(level=1)
+
             data = data.reset_index()
 
-            # history()는 단일 인덱스 컬럼을 반환하므로 MultiIndex 문제 없음
-            # 컬럼명 표준화
-            col_map = {}
-            for c in data.columns:
-                name = str(c).strip()
-                if name.lower() == "date":
-                    col_map[c] = "Date"
-                elif name.lower() == "open":
-                    col_map[c] = "Open"
-                elif name.lower() == "high":
-                    col_map[c] = "High"
-                elif name.lower() == "low":
-                    col_map[c] = "Low"
-                elif name.lower() == "close":
-                    col_map[c] = "Close"
-                elif name.lower() in ("adj close", "adj_close", "adjclose"):
-                    col_map[c] = "Adj Close"
-                elif name.lower() == "volume":
-                    col_map[c] = "Volume"
-            data = data.rename(columns=col_map)
+            # 필요한 컬럼 검증
+            if not VALID_CHECK_COLS.issubset(set(data.columns)):
+                raise ValueError(f"MISSING_COLUMNS: {data.columns.tolist()}")
 
-            # 필요한 컬럼만 추출 (Adj Close가 있으면 포함)
             keep = [c for c in OHLCV_COLS_WITH_ADJ if c in data.columns]
-            if not keep or "Date" not in keep:
-                raise ValueError("MISSING_COLUMNS")
             data = data[keep]
 
             data.to_csv(out_path, index=False, encoding="utf-8-sig")
@@ -127,7 +115,12 @@ def download_one(ticker: str) -> tuple[str, bool, str]:
 
 # ── 4) 청크 단위 병렬 다운로드 ─────────────────────────────
 def download_all(tickers: list[str]) -> tuple[list, list]:
+    # ★ 이전 실행의 깨진 캐시 방지: raw/clean 폴더 초기화
+    for d in (OUTDIR_RAW, OUTDIR_CLEAN):
+        if os.path.exists(d):
+            shutil.rmtree(d)
     os.makedirs(OUTDIR_RAW, exist_ok=True)
+    os.makedirs(OUTDIR_CLEAN, exist_ok=True)
 
     chunks = [tickers[i : i + CHUNK_SIZE] for i in range(0, len(tickers), CHUNK_SIZE)]
     log.info("총 %d개 chunk", len(chunks))
@@ -178,17 +171,11 @@ def download_all(tickers: list[str]) -> tuple[list, list]:
 
 # ── 5) 클린 함수 ──────────────────────────────────────────
 UNNAMED_RE = re.compile(r"^\s*unnamed", re.I)
-DUP_SUFFIX_RE = re.compile(r"^(.*)\.(\d+)$")  # Open.1 → Open
+DUP_SUFFIX_RE = re.compile(r"^(.*)\.(\d+)$")
 REQUIRED = ["Date", "Open", "High", "Low", "Close", "Volume"]
 
 
 def normalize_columns(cols: list) -> tuple[list[int], list[str]]:
-    """
-    - 'Open.1' 같은 중복 컬럼을 'Open'으로 정규화
-    - Unnamed 제거
-    - 동일 base 컬럼 중 첫 번째만 유지
-    반환: (keep_indices, clean_names)
-    """
     keep_idx: list[int] = []
     clean_names: list[str] = []
     seen: set[str] = set()
@@ -216,12 +203,10 @@ def normalize_columns(cols: list) -> tuple[list[int], list[str]]:
 
 
 def clean_ohlcv_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
-    # 1) 컬럼 정리(중복 제거)
     keep_idx, clean_names = normalize_columns(df.columns.tolist())
     df = df.iloc[:, keep_idx].copy()
     df.columns = clean_names
 
-    # 2) Date 파싱 (정크행 제거 핵심: Date 파싱 실패 행 제거)
     if "Date" not in df.columns:
         return None
 
@@ -231,7 +216,6 @@ def clean_ohlcv_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
     if df.empty:
         return None
 
-    # 3) 필요한 컬럼만 남김 (Adj Close가 있으면 포함)
     output_cols = REQUIRED.copy()
     if "Adj Close" in df.columns:
         output_cols.append("Adj Close")
@@ -241,15 +225,12 @@ def clean_ohlcv_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame | None:
             df[c] = pd.NA
     df = df[output_cols].copy()
 
-    # 4) 숫자형 변환
     numeric_cols = [c for c in output_cols if c != "Date"]
     for c in numeric_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # 5) ticker 컬럼 추가
     df["ticker"] = ticker
 
-    # 6) 정렬/중복 제거
     df = (
         df.sort_values("Date")
         .drop_duplicates(subset=["Date"], keep="last")
@@ -316,12 +297,31 @@ def create_zip(zip_name: str = "nasdaq_by_ticker_csv_CLEAN.zip") -> str:
     return zip_name
 
 
+# ── 8) 검증 ───────────────────────────────────────────────
+def verify_sample(tickers_to_check=("TSLA", "NVDA", "AMZN", "AAPL", "MSFT")):
+    log.info("=== 데이터 검증 ===")
+    for t in tickers_to_check:
+        path = os.path.join(OUTDIR_CLEAN, f"{t}.csv")
+        if not os.path.exists(path):
+            log.warning("%s: 파일 없음", t)
+            continue
+        df = pd.read_csv(path)
+        latest = df.tail(1).iloc[0]
+        log.info(
+            "%s | 최신: %s | O=%.2f H=%.2f L=%.2f C=%.2f V=%d | rows=%d",
+            t, latest["Date"],
+            latest["Open"], latest["High"], latest["Low"], latest["Close"],
+            int(latest["Volume"]), len(df),
+        )
+
+
 # ── main ───────────────────────────────────────────────────
 def main():
     tickers = load_tickers()
     download_all(tickers)
     clean_all()
     zip_path = create_zip()
+    verify_sample()
     log.info("완료! ZIP 파일: %s", zip_path)
 
 

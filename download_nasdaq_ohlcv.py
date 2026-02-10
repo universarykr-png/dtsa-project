@@ -104,6 +104,13 @@ def download_one(ticker: str) -> tuple[str, bool, str]:
             keep = [c for c in OHLCV_COLS_WITH_ADJ if c in data.columns]
             data = data[keep]
 
+            # ★ float64 → 소수점 2자리 반올림 (Yahoo Finance와 동일한 값)
+            for c in ["Open", "High", "Low", "Close", "Adj Close"]:
+                if c in data.columns:
+                    data[c] = data[c].round(2)
+            if "Volume" in data.columns:
+                data["Volume"] = data["Volume"].astype(int)
+
             data.to_csv(out_path, index=False, encoding="utf-8-sig")
             return ticker, True, f"OK ({len(data)} rows)"
 
